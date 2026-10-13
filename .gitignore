@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Database
+*.db
+*.db-journal
+
+# Uploads
+uploads/
+
+# Environment
+.env
+
+# Build output
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+test_invoicepilot.db
+.pytest_cache/
+.coverage
+htmlcov/

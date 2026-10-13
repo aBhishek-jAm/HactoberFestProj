@@ -1,0 +1,32 @@
+INVOICE
+
+From: Acme Design Studio
+123 Creative Avenue, Suite 400
+San Francisco, CA 94105
+
+Bill To: Freelance Corp
+456 Side Hustle Lane
+Austin, TX 78701
+
+Invoice Number: INV-2026-0042
+Invoice Date: 2026-10-01
+Due Date: 2026-10-31
+Currency: USD
+
+Description                    Qty    Unit Price    Tax       Total
+---------------------------------------------------------------------------
+Brand Identity Package          1      2,500.00    250.00    2,750.00
+Website Redesign (5 pages)      1      4,000.00    400.00    4,400.00
+Social Media Kit                1        800.00     80.00      880.00
+
+---------------------------------------------------------------------------
+Subtotal:                                                    7,300.00
+Tax (10%):                                                     730.00
+Discount:                                                        0.00
+---------------------------------------------------------------------------
+TOTAL:                                                       8,030.00
+
+Payment Status: Unpaid
+Payment Terms: Net 30
+Bank: First National Bank
+Account: 1234567890

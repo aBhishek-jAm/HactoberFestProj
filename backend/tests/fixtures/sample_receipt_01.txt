@@ -1,0 +1,20 @@
+RECEIPT
+
+CloudStack Pro — Monthly Subscription
+
+Receipt No: REC-78234
+Date: 2026-09-15
+
+Item                         Amount
+-------------------------------------
+CloudStack Pro Plan           $49.99
+Additional Storage (50GB)     $9.99
+
+Total:                        $59.98
+Currency: USD
+
+Payment Method: Visa **** 4242
+Status: Paid
+
+Thank you for your business!
+support@cloudstackpro.example

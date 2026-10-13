@@ -1,0 +1,39 @@
+TAX INVOICE
+
+Global Tech Solutions Pvt. Ltd.
+42 MG Road, Bengaluru 560001
+GSTIN: 29AADCG1234R1ZP
+
+Invoice To:
+IndieDevs Inc.
+88 Koramangala, Bengaluru
+
+Invoice Number: GST/2026/0198
+Invoice Date: 15/09/2026
+Due Date: 15/10/2026
+
+Sl. Description                 HSN     Qty   Rate      CGST     SGST     Total
+---------------------------------------------------------------------------------
+1.  Web Application Dev         998314   1    80,000    7,200    7,200    94,400
+2.  Cloud Hosting (Annual)      998315   1    24,000    2,160    2,160    28,320
+3.  SSL Certificate             998316   2     1,500      270      270     4,080
+
+---------------------------------------------------------------------------------
+Subtotal:                                                              1,05,500
+CGST (9%):                                                               9,630
+SGST (9%):                                                               9,630
+Total Tax:                                                              19,260
+Discount:                                                                    0
+---------------------------------------------------------------------------------
+Grand Total: INR 1,26,800.00
+
+Amount in words: Indian Rupees One Lakh Twenty Six Thousand Eight Hundred Only
+
+Payment Status: Partial
+Amount Paid: INR 50,000.00
+Outstanding: INR 76,800.00
+
+Bank Details:
+HDFC Bank, MG Road Branch
+A/C: 50200012345678
+IFSC: HDFC0001234
