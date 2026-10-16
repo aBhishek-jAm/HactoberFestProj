@@ -1,7 +1,8 @@
 """InvoicePilot AI — AI extraction service using Ollama + Gemma.
 
 Sends extracted document text to a local Gemma model and parses
-structured invoice data from the response.
+structured invoice data from the response. Falls back to intelligent
+regex-based heuristic extraction when Ollama is unavailable.
 """
 
 import json
@@ -12,7 +13,7 @@ from typing import Optional
 import httpx
 
 from app.config import settings
-from app.schemas import AIExtractionResult
+from app.schemas import AIExtractionResult, AILineItem
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ Document text:
 
 
 class AIExtractor:
-    """Extracts structured invoice data using Ollama + Gemma."""
+    """Extracts structured invoice data using Ollama + Gemma with regex fallback."""
 
     def __init__(self):
         self.base_url = settings.ollama_base_url
@@ -104,13 +105,14 @@ class AIExtractor:
                         "status": "disconnected",
                         "model": self.model,
                         "ollama_url": self.base_url,
-                        "message": "Ollama is not responding.",
+                        "message": "Ollama is not responding. Heuristic extraction will be used.",
                     }
 
                 # Check if model is available
                 models = resp.json().get("models", [])
                 model_names = [m.get("name", "") for m in models]
-                # Check both exact match and prefix match (e.g. "gemma3:4b" matches "gemma3:4b")
+
+                # Check both exact match and prefix match
                 model_available = any(
                     self.model in name or name.startswith(self.model.split(":")[0])
                     for name in model_names
@@ -124,14 +126,26 @@ class AIExtractor:
                         "message": f"Model '{self.model}' is available.",
                     }
                 else:
+                    # Try to auto-detect any available model
+                    if model_names:
+                        available_str = ", ".join(model_names)
+                        return {
+                            "status": "fallback",
+                            "model": self.model,
+                            "ollama_url": self.base_url,
+                            "message": (
+                                f"Model '{self.model}' not found. "
+                                f"Available: {available_str}. "
+                                f"Will use heuristic extraction. "
+                                f"Run: ollama pull {self.model}"
+                            ),
+                        }
                     return {
                         "status": "disconnected",
                         "model": self.model,
                         "ollama_url": self.base_url,
                         "message": (
-                            f"Model '{self.model}' not found. "
-                            f"Available: {', '.join(model_names) or 'none'}. "
-                            f"Run: ollama pull {self.model}"
+                            f"No models found. Run: ollama pull {self.model}"
                         ),
                     }
         except httpx.ConnectError:
@@ -139,54 +153,101 @@ class AIExtractor:
                 "status": "disconnected",
                 "model": self.model,
                 "ollama_url": self.base_url,
-                "message": "Cannot connect to Ollama. Is it running?",
+                "message": "Cannot connect to Ollama. Heuristic extraction will be used.",
             }
         except Exception as e:
             return {
                 "status": "disconnected",
                 "model": self.model,
                 "ollama_url": self.base_url,
-                "message": f"Health check failed: {type(e).__name__}",
+                "message": f"Health check failed: {type(e).__name__}. Heuristic extraction will be used.",
             }
+
+    async def _find_working_model(self) -> Optional[str]:
+        """Try to find any available model in Ollama."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{self.base_url}/api/tags")
+                if resp.status_code != 200:
+                    return None
+                models = resp.json().get("models", [])
+                model_names = [m.get("name", "") for m in models]
+
+                # Prefer the configured model
+                for name in model_names:
+                    if self.model in name or name.startswith(self.model.split(":")[0]):
+                        return name
+
+                # Fall back to any gemma model
+                for name in model_names:
+                    if "gemma" in name.lower():
+                        return name
+
+                # Fall back to any available model
+                if model_names:
+                    return model_names[0]
+        except Exception:
+            pass
+        return None
 
     async def extract(self, document_text: str) -> AIExtractionResult:
         """
         Send document text to Gemma and parse the structured extraction result.
-        Retries on malformed JSON up to max_retries times.
+        Falls back to heuristic regex extraction if Ollama is unavailable.
         """
         if settings.demo_mode:
-            return self._demo_extraction(document_text)
+            return self._heuristic_extraction(document_text)
 
-        # Truncate text to fit within context window (rough token estimate)
-        truncated = self._truncate_text(document_text)
-        prompt = EXTRACTION_PROMPT.format(
-            document_text=truncated,
-            categories=", ".join(EXPENSE_CATEGORIES),
-        )
+        # Try AI extraction first
+        try:
+            # Find a working model (may differ from config)
+            working_model = await self._find_working_model()
 
-        last_error: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                raw_response = await self._call_ollama(prompt)
-                result = self._parse_response(raw_response)
-                logger.info("AI extraction succeeded on attempt %d", attempt)
-                return result
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(
-                    "AI extraction attempt %d/%d failed: %s",
-                    attempt, self.max_retries, str(e)
+            if working_model:
+                logger.info("Using Ollama model: %s", working_model)
+                truncated = self._truncate_text(document_text)
+                prompt = EXTRACTION_PROMPT.format(
+                    document_text=truncated,
+                    categories=", ".join(EXPENSE_CATEGORIES),
                 )
-                last_error = e
 
-        raise ValueError(
-            f"AI extraction failed after {self.max_retries} attempts: {last_error}"
-        )
+                last_error: Optional[Exception] = None
+                for attempt in range(1, self.max_retries + 1):
+                    try:
+                        raw_response = await self._call_ollama(prompt, working_model)
+                        result = self._parse_response(raw_response)
+                        logger.info("AI extraction succeeded on attempt %d", attempt)
+                        return result
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logger.warning(
+                            "AI extraction attempt %d/%d failed: %s",
+                            attempt, self.max_retries, str(e)
+                        )
+                        last_error = e
 
-    async def _call_ollama(self, prompt: str) -> str:
+                logger.warning(
+                    "AI extraction failed after %d attempts, falling back to heuristic: %s",
+                    self.max_retries, last_error,
+                )
+            else:
+                logger.info("No Ollama model available, using heuristic extraction")
+
+        except httpx.ConnectError:
+            logger.info("Cannot connect to Ollama, using heuristic extraction")
+        except httpx.HTTPStatusError as e:
+            logger.warning("Ollama HTTP error %s, using heuristic extraction", e.response.status_code)
+        except Exception as e:
+            logger.warning("Ollama error (%s): %s, using heuristic extraction", type(e).__name__, str(e)[:100])
+
+        # Fallback to regex-based heuristic extraction
+        return self._heuristic_extraction(document_text)
+
+    async def _call_ollama(self, prompt: str, model: Optional[str] = None) -> str:
         """Call Ollama generate API and return the response text."""
+        use_model = model or self.model
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             payload = {
-                "model": self.model,
+                "model": use_model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {
@@ -235,18 +296,426 @@ class AIExtractor:
             return text[:max_chars] + "\n[...truncated...]"
         return text
 
+    # ──────────────────────────────────────────
+    # Heuristic / Regex-Based Fallback Extractor
+    # ──────────────────────────────────────────
+
+    def _heuristic_extraction(self, text: str) -> AIExtractionResult:
+        """
+        Intelligent regex-based extraction when Ollama is unavailable.
+        Parses vendor info, invoice numbers, dates, monetary amounts,
+        and line items directly from the document text.
+        """
+        logger.info("Running heuristic extraction on %d chars of text", len(text))
+
+        vendor_name = self._extract_vendor_name(text)
+        vendor_address = self._extract_vendor_address(text)
+        invoice_number = self._extract_invoice_number(text)
+        invoice_date = self._extract_date(text, ["invoice date", "date", "issued", "invoice dt"])
+        due_date = self._extract_date(text, ["due date", "due", "payment due", "due dt"])
+        currency = self._extract_currency(text)
+        amounts = self._extract_amounts(text)
+        payment_status = self._extract_payment_status(text)
+        doc_type = self._extract_document_type(text)
+        line_items = self._extract_line_items(text)
+        category = self._categorize_expense(text, vendor_name)
+
+        return AIExtractionResult(
+            vendor_name=vendor_name,
+            vendor_address=vendor_address,
+            invoice_number=invoice_number,
+            invoice_date=invoice_date,
+            due_date=due_date,
+            currency=currency,
+            subtotal=amounts.get("subtotal"),
+            tax_amount=amounts.get("tax"),
+            discount=amounts.get("discount"),
+            total_amount=amounts.get("total"),
+            amount_paid=amounts.get("paid"),
+            outstanding_amount=amounts.get("outstanding"),
+            payment_status=payment_status,
+            expense_category=category,
+            document_type=doc_type,
+            line_items=line_items if line_items else None,
+        )
+
+    def _extract_vendor_name(self, text: str) -> Optional[str]:
+        """Extract vendor/company name from document."""
+        lines = text.strip().split("\n")
+        # Skip header keywords, look for first substantial line
+        skip = {"invoice", "receipt", "tax invoice", "bill", "credit note",
+                "statement", "purchase order", "from:", "bill to:", "to:"}
+
+        # Try "From:" pattern first
+        for line in lines:
+            clean = line.strip()
+            lower = clean.lower()
+            if lower.startswith("from:") or lower.startswith("supplier:") or lower.startswith("vendor:"):
+                name = clean.split(":", 1)[1].strip()
+                if name and len(name) > 2:
+                    return name
+
+        # Look for company-like names (LLC, Inc, Ltd, Corp, etc.)
+        company_re = re.compile(
+            r"([A-Z][A-Za-z\s&\-\.]+(?:LLC|Inc\.?|Ltd\.?|Corp\.?|Co\.?|Pvt\.?\s*Ltd\.?|"
+            r"Private\s+Limited|Limited|Consulting|Studio|Technologies|Solutions|Services|"
+            r"Agency|Group|Partners))",
+            re.IGNORECASE,
+        )
+        match = company_re.search(text[:1500])  # Search first portion
+        if match:
+            return match.group(1).strip()
+
+        # Fallback: first non-trivial line that's not a keyword
+        for line in lines[:10]:
+            clean = line.strip()
+            if (
+                clean
+                and len(clean) > 3
+                and len(clean) < 80
+                and clean.lower() not in skip
+                and not clean.startswith("---")
+                and not clean.startswith("===")
+            ):
+                return clean
+
+        return None
+
+    def _extract_vendor_address(self, text: str) -> Optional[str]:
+        """Extract address from text."""
+        # Look for lines with address patterns (street numbers, city/state/zip)
+        addr_re = re.compile(
+            r"(\d+\s+[\w\s]+(?:Avenue|Ave|Street|St|Road|Rd|Lane|Ln|Drive|Dr|Boulevard|Blvd|Block|MG\s+Road)"
+            r"[^,\n]*(?:,\s*[^,\n]+){0,3})",
+            re.IGNORECASE,
+        )
+        match = addr_re.search(text[:2000])
+        if match:
+            return match.group(1).strip()
+        return None
+
+    def _extract_invoice_number(self, text: str) -> Optional[str]:
+        """Extract invoice/receipt number."""
+        patterns = [
+            r"(?:Invoice|Inv|Receipt|Rec)[\s#\.:\-]*(?:No|Number|Num|#)?[\s#\.:\-]*([A-Z0-9][\w\-/]{2,25})",
+            r"(?:Invoice|Receipt|Order|Ref)[\s]*(?:Number|No\.?|#)[\s:]*([A-Z0-9][\w\-/]{2,25})",
+            r"#\s*([A-Z]{2,5}[\-/]\d{2,}[\w\-]*)",
+        ]
+        for pat in patterns:
+            match = re.search(pat, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return None
+
+    def _extract_date(self, text: str, keywords: list[str]) -> Optional[str]:
+        """Extract a date associated with given keywords."""
+        # Date patterns: YYYY-MM-DD, DD/MM/YYYY, MM/DD/YYYY, DD-MM-YYYY, etc.
+        date_re = r"(\d{4}[\-/]\d{1,2}[\-/]\d{1,2}|\d{1,2}[\-/]\d{1,2}[\-/]\d{4}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\.?\s+\d{4})"
+
+        for kw in keywords:
+            pattern = rf"(?:{kw})\s*[:]\s*{date_re}"
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return self._normalize_date(match.group(1))
+
+        # Look for any date near the top of the document
+        for line in text.split("\n")[:30]:
+            match = re.search(date_re, line, re.IGNORECASE)
+            if match and any(kw in line.lower() for kw in keywords):
+                return self._normalize_date(match.group(1))
+
+        return None
+
+    def _normalize_date(self, date_str: str) -> str:
+        """Try to normalize a date string to YYYY-MM-DD."""
+        import re as re_mod
+        from datetime import datetime
+
+        date_str = date_str.strip()
+
+        # Already YYYY-MM-DD
+        if re_mod.match(r"\d{4}-\d{1,2}-\d{1,2}$", date_str):
+            return date_str
+
+        # DD/MM/YYYY or MM/DD/YYYY
+        match = re_mod.match(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$", date_str)
+        if match:
+            a, b, year = int(match.group(1)), int(match.group(2)), match.group(3)
+            if a > 12:  # Must be DD/MM/YYYY
+                return f"{year}-{b:02d}-{a:02d}"
+            elif b > 12:  # Must be MM/DD/YYYY
+                return f"{year}-{a:02d}-{b:02d}"
+            else:
+                # Ambiguous, assume DD/MM/YYYY (international format)
+                return f"{year}-{b:02d}-{a:02d}"
+
+        # YYYY/MM/DD
+        match = re_mod.match(r"(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$", date_str)
+        if match:
+            return f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+
+        # "15 September 2026" style
+        month_names = {
+            "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+            "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+        }
+        match = re_mod.match(r"(\d{1,2})\s+(\w{3})\w*\.?\s+(\d{4})", date_str)
+        if match:
+            day, mon, year = match.group(1), match.group(2).lower()[:3], match.group(3)
+            if mon in month_names:
+                return f"{year}-{month_names[mon]}-{int(day):02d}"
+
+        return date_str
+
+    def _extract_currency(self, text: str) -> Optional[str]:
+        """Detect currency from text."""
+        text_upper = text.upper()
+
+        # Explicit currency mentions
+        currency_patterns = [
+            (r"\b(USD|US\s*Dollar)\b", "USD"),
+            (r"\b(EUR|Euro)\b", "EUR"),
+            (r"\b(GBP|British\s*Pound)\b", "GBP"),
+            (r"\b(INR|Indian\s*Rupee)\b", "INR"),
+            (r"\b(CAD|Canadian\s*Dollar)\b", "CAD"),
+            (r"\b(AUD|Australian\s*Dollar)\b", "AUD"),
+            (r"\b(JPY|Japanese\s*Yen)\b", "JPY"),
+        ]
+        for pat, code in currency_patterns:
+            if re.search(pat, text_upper):
+                return code
+
+        # Symbol detection
+        if "₹" in text or "INR" in text_upper or "RUPEE" in text_upper:
+            return "INR"
+        if "€" in text:
+            return "EUR"
+        if "£" in text:
+            return "GBP"
+        if "¥" in text:
+            return "JPY"
+        if "$" in text:
+            return "USD"
+
+        # Currency keyword near amounts
+        curr_kw_re = re.search(r"(?:Currency|Curr)[\s:]*([A-Z]{3})", text, re.IGNORECASE)
+        if curr_kw_re:
+            return curr_kw_re.group(1).upper()
+
+        return "USD"  # Default
+
+    def _extract_amounts(self, text: str) -> dict:
+        """Extract monetary amounts (total, subtotal, tax, etc.)."""
+        amounts = {}
+
+        # Amount extraction patterns — maps keywords to dict keys
+        amount_keywords = {
+            "total": [
+                r"(?:grand\s+)?total\s*(?:due|amount|invoice\s*value|charged)?[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+                r"total\s*\(?\s*(?:USD|EUR|GBP|INR|CAD|AUD)?\s*\)?[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+            ],
+            "subtotal": [
+                r"sub[\s\-]?total[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+                r"taxable\s+amount[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+            ],
+            "tax": [
+                r"(?:tax|vat|gst|cgst|sgst|igst|sales\s+tax)[\s\(][^:]*?[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+                r"tax[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+            ],
+            "discount": [
+                r"discount[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+            ],
+            "paid": [
+                r"(?:amount\s+)?paid[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+            ],
+            "outstanding": [
+                r"(?:outstanding|balance\s+due|amount\s+due)[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+            ],
+        }
+
+        for key, patterns in amount_keywords.items():
+            for pat in patterns:
+                match = re.search(pat, text, re.IGNORECASE)
+                if match:
+                    try:
+                        val = float(match.group(1).replace(",", ""))
+                        if val > 0:
+                            amounts[key] = val
+                            break
+                    except ValueError:
+                        continue
+
+        # If we found tax amounts but no single "tax", sum CGST+SGST
+        if "tax" not in amounts:
+            cgst = sgst = 0.0
+            for pat_name, pat_val in [("cgst", r"CGST[^:]*?:\s*[^\d]*([\d,]+\.?\d{0,2})"),
+                                       ("sgst", r"SGST[^:]*?:\s*[^\d]*([\d,]+\.?\d{0,2})")]:
+                m = re.search(pat_val, text, re.IGNORECASE)
+                if m:
+                    try:
+                        if pat_name == "cgst":
+                            cgst = float(m.group(1).replace(",", ""))
+                        else:
+                            sgst = float(m.group(1).replace(",", ""))
+                    except ValueError:
+                        pass
+            if cgst + sgst > 0:
+                amounts["tax"] = cgst + sgst
+
+        # If no subtotal but have total and tax, derive it
+        if "subtotal" not in amounts and "total" in amounts and "tax" in amounts:
+            amounts["subtotal"] = round(amounts["total"] - amounts["tax"], 2)
+
+        return amounts
+
+    def _extract_payment_status(self, text: str) -> Optional[str]:
+        """Detect payment status from document text."""
+        text_lower = text.lower()
+
+        if any(kw in text_lower for kw in ["paid", "approved", "settled", "payment received"]):
+            if any(kw in text_lower for kw in ["unpaid", "not paid", "amount due", "balance due", "outstanding"]):
+                return "unpaid"
+            return "paid"
+
+        if any(kw in text_lower for kw in ["unpaid", "overdue", "pending", "amount due", "balance due"]):
+            return "unpaid"
+
+        if "partial" in text_lower:
+            return "partial"
+
+        return None
+
+    def _extract_document_type(self, text: str) -> str:
+        """Determine document type."""
+        text_lower = text.lower()
+        if "receipt" in text_lower:
+            return "receipt"
+        if "credit note" in text_lower or "credit memo" in text_lower:
+            return "credit_note"
+        if "invoice" in text_lower or "bill" in text_lower:
+            return "invoice"
+        return "invoice"
+
+    def _extract_line_items(self, text: str) -> list[AILineItem]:
+        """Extract line items from structured text."""
+        items = []
+
+        # Pattern: description followed by amount(s)
+        # Look for lines with a dollar/currency amount
+        amount_line_re = re.compile(
+            r"^[\s]*(.{5,60}?)\s{2,}(\d+)?\s*[\$₹€£]?\s*([\d,]+\.?\d{0,2})\s*$",
+            re.MULTILINE,
+        )
+
+        for match in amount_line_re.finditer(text):
+            desc = match.group(1).strip()
+            qty_str = match.group(2)
+            amount_str = match.group(3)
+
+            # Skip header/summary lines
+            skip_words = {"total", "subtotal", "tax", "discount", "due", "paid", "balance",
+                          "description", "amount", "qty", "quantity", "item", "---"}
+            if any(sw in desc.lower() for sw in skip_words):
+                continue
+
+            try:
+                amount = float(amount_str.replace(",", ""))
+                qty = float(qty_str) if qty_str else 1.0
+                unit_price = round(amount / qty, 2) if qty > 0 else amount
+
+                items.append(AILineItem(
+                    description=desc,
+                    quantity=qty,
+                    unit_price=unit_price,
+                    line_total=amount,
+                ))
+            except (ValueError, ZeroDivisionError):
+                continue
+
+        # Also try "description   $amount" pattern (with currency symbol)
+        if not items:
+            currency_line_re = re.compile(
+                r"^[\s]*(.{5,60}?)\s+[\$₹€£]\s*([\d,]+\.?\d{0,2})\s*$",
+                re.MULTILINE,
+            )
+            for match in currency_line_re.finditer(text):
+                desc = match.group(1).strip()
+                amount_str = match.group(2)
+
+                skip_words = {"total", "subtotal", "tax", "discount", "due", "paid", "balance"}
+                if any(sw in desc.lower() for sw in skip_words):
+                    continue
+
+                try:
+                    amount = float(amount_str.replace(",", ""))
+                    items.append(AILineItem(
+                        description=desc,
+                        quantity=1.0,
+                        unit_price=amount,
+                        line_total=amount,
+                    ))
+                except ValueError:
+                    continue
+
+        return items[:20]  # Cap at 20 items
+
+    def _categorize_expense(self, text: str, vendor_name: Optional[str] = None) -> str:
+        """Categorize expense based on document content."""
+        combined = (text + " " + (vendor_name or "")).lower()
+
+        category_keywords = {
+            "Software & Subscriptions": [
+                "software", "subscription", "saas", "cloud", "hosting", "domain",
+                "license", "api", "storage", "backup", "plan", "pro plan",
+            ],
+            "Professional Services": [
+                "consulting", "legal", "accounting", "advisory", "audit",
+                "design", "development", "architecture", "engineering",
+                "freelance", "contractor",
+            ],
+            "Travel": [
+                "flight", "hotel", "airfare", "uber", "taxi", "rental car",
+                "transportation", "travel", "lodging", "mileage",
+            ],
+            "Food & Meals": [
+                "restaurant", "cafe", "coffee", "catering", "lunch", "dinner",
+                "breakfast", "meal", "food", "beverage", "latte", "croissant",
+            ],
+            "Office Supplies": [
+                "office", "paper", "printer", "toner", "stationery", "supplies",
+                "desk", "chair", "monitor",
+            ],
+            "Equipment": [
+                "computer", "laptop", "phone", "hardware", "server", "gpu",
+                "keyboard", "mouse", "headset", "camera",
+            ],
+            "Marketing": [
+                "advertising", "marketing", "ads", "promotion", "social media",
+                "seo", "campaign", "branding",
+            ],
+            "Utilities": [
+                "electric", "gas", "water", "internet", "phone bill", "utility",
+                "broadband", "fiber", "mobile",
+            ],
+            "Rent": ["rent", "lease", "coworking", "office space", "workspace"],
+            "Insurance": ["insurance", "policy", "premium", "coverage"],
+        }
+
+        best_category = "Other"
+        best_score = 0
+
+        for category, keywords in category_keywords.items():
+            score = sum(1 for kw in keywords if kw in combined)
+            if score > best_score:
+                best_score = score
+                best_category = category
+
+        return best_category
+
     def _demo_extraction(self, document_text: str) -> AIExtractionResult:
         """Return a demo extraction result when AI is unavailable."""
-        # Only used in explicit demo mode
-        return AIExtractionResult(
-            vendor_name="[Demo] Sample Vendor",
-            invoice_number="DEMO-001",
-            invoice_date="2026-01-15",
-            currency="USD",
-            total_amount=0.0,
-            document_type="invoice",
-            expense_category="Other",
-        )
+        # Only used in explicit demo mode — now redirects to heuristic
+        return self._heuristic_extraction(document_text)
 
 
 # Module-level singleton

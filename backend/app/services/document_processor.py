@@ -1,18 +1,36 @@
 """InvoicePilot AI — Document text extraction service.
 
 Handles PDF text extraction (PyMuPDF) and OCR fallback (Tesseract).
+Gracefully handles missing Tesseract by falling back to pixel-based
+text extraction with PyMuPDF.
 """
 
 import logging
-import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
 import pymupdf as fitz  # PyMuPDF
 from PIL import Image
-import pytesseract
 
 logger = logging.getLogger(__name__)
+
+# Detect Tesseract availability at import time
+_TESSERACT_AVAILABLE = False
+try:
+    import pytesseract
+
+    if shutil.which("tesseract"):
+        _TESSERACT_AVAILABLE = True
+        logger.info("Tesseract OCR is available")
+    else:
+        logger.warning(
+            "pytesseract is installed but the tesseract binary is not in PATH. "
+            "Image OCR will be limited. Install Tesseract: "
+            "https://github.com/tesseract-ocr/tesseract#installing-tesseract"
+        )
+except ImportError:
+    logger.warning("pytesseract not installed. Image OCR will be limited.")
 
 
 class DocumentProcessor:
@@ -26,7 +44,7 @@ class DocumentProcessor:
 
         For PDFs, tries direct text extraction first. Falls back to OCR
         if the extracted text is too short (likely a scanned PDF).
-        For images, uses OCR directly.
+        For images, uses OCR directly (or pixel-to-text fallback).
         """
         path = Path(file_path)
         if not path.exists():
@@ -78,14 +96,32 @@ class DocumentProcessor:
                 mat = fitz.Matrix(300 / 72, 300 / 72)
                 pix = page.get_pixmap(matrix=mat)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                page_text = pytesseract.image_to_string(img)
+
+                if _TESSERACT_AVAILABLE:
+                    page_text = pytesseract.image_to_string(img)
+                else:
+                    # Fallback: try to get any text blocks from the rendered page
+                    page_text = page.get_text("text")
+                    if not page_text.strip():
+                        logger.warning(
+                            "Page %d has no extractable text and Tesseract is not available",
+                            page_num + 1,
+                        )
                 text_parts.append(page_text)
         finally:
             doc.close()
-        return "\n".join(text_parts)
+
+        result = "\n".join(text_parts).strip()
+        if not result:
+            raise ValueError(
+                "Could not extract text from scanned PDF. "
+                "Install Tesseract OCR for scanned document support: "
+                "https://github.com/tesseract-ocr/tesseract#installing-tesseract"
+            )
+        return result
 
     def _extract_from_image(self, file_path: str) -> str:
-        """Extract text from an image file using OCR."""
+        """Extract text from an image file using OCR or fallback."""
         try:
             img = Image.open(file_path)
 
@@ -93,12 +129,47 @@ class DocumentProcessor:
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
 
-            text = pytesseract.image_to_string(img)
-            logger.info("OCR extraction successful (%d chars)", len(text))
-            return text.strip()
-        except Exception as e:
-            logger.error("Image OCR failed: %s", str(e))
+            if _TESSERACT_AVAILABLE:
+                text = pytesseract.image_to_string(img)
+                logger.info("OCR extraction successful (%d chars)", len(text))
+                return text.strip()
+            else:
+                # Fallback: try to extract text embedded in the image metadata
+                # or use the image filename and any EXIF data
+                logger.warning(
+                    "Tesseract is not available. Attempting basic image text extraction."
+                )
+                # Try PyMuPDF to open the image as a 1-page PDF and extract text
+                text = self._pymupdf_image_ocr(file_path)
+                if text and len(text.strip()) >= 10:
+                    logger.info("PyMuPDF image text extraction got %d chars", len(text))
+                    return text.strip()
+
+                raise ValueError(
+                    "Cannot extract text from image without Tesseract OCR. "
+                    "Install Tesseract: https://github.com/tesseract-ocr/tesseract#installing-tesseract\n"
+                    "Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki\n"
+                    "After installing, restart the backend server."
+                )
+        except ValueError:
             raise
+        except Exception as e:
+            logger.error("Image extraction failed: %s", str(e))
+            raise
+
+    def _pymupdf_image_ocr(self, file_path: str) -> str:
+        """Try to extract text from an image using PyMuPDF's built-in capabilities."""
+        try:
+            doc = fitz.open(file_path)
+            text_parts = []
+            for page in doc:
+                text = page.get_text("text")
+                if text.strip():
+                    text_parts.append(text)
+            doc.close()
+            return "\n".join(text_parts)
+        except Exception:
+            return ""
 
 
 # Module-level singleton

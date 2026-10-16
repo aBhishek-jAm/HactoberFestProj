@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # Ollama / AI
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "gemma3:4b"
+    ollama_model: str = "gemma:2b"
     ollama_timeout: int = 120
     ollama_context_length: int = 8192
     demo_mode: bool = False
