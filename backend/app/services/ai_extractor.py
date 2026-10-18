@@ -250,8 +250,10 @@ class AIExtractor:
                 "model": use_model,
                 "prompt": prompt,
                 "stream": False,
+                "format": "json",  # Force JSON output for faster, structured responses
                 "options": {
                     "num_ctx": self.context_length,
+                    "num_predict": settings.ollama_num_predict,
                     "temperature": 0.1,  # Low temp for structured extraction
                 },
             }
@@ -261,6 +263,7 @@ class AIExtractor:
             )
             resp.raise_for_status()
             return resp.json().get("response", "")
+
 
     def _parse_response(self, raw: str) -> AIExtractionResult:
         """Parse raw model output into validated AIExtractionResult."""
@@ -397,14 +400,23 @@ class AIExtractor:
     def _extract_invoice_number(self, text: str) -> Optional[str]:
         """Extract invoice/receipt number."""
         patterns = [
-            r"(?:Invoice|Inv|Receipt|Rec)[\s#\.:\-]*(?:No|Number|Num|#)?[\s#\.:\-]*([A-Z0-9][\w\-/]{2,25})",
-            r"(?:Invoice|Receipt|Order|Ref)[\s]*(?:Number|No\.?|#)[\s:]*([A-Z0-9][\w\-/]{2,25})",
+            # "Invoice #: INV-2026-0042" or "Invoice No: 12345"
+            r"(?:Invoice|Inv|Receipt|Rec)\s*(?:#|No\.?|Number|Num)\s*[:.]?\s*([A-Z0-9][\w\-/]{2,25})",
+            # "Receipt No: REC-78234"
+            r"(?:Receipt|Order|Ref)\s*(?:#|No\.?|Number)\s*[:.]?\s*([A-Z0-9][\w\-/]{2,25})",
+            # Standalone "# INV-2026-001"
             r"#\s*([A-Z]{2,5}[\-/]\d{2,}[\w\-]*)",
+            # "Invoice No: GST/2026/0198" (with slash-based numbers)
+            r"(?:Invoice|Inv)\s*(?:No\.?|Number|#)\s*[:.]?\s*([A-Za-z0-9][\w\-/]{3,25})",
         ]
         for pat in patterns:
             match = re.search(pat, text, re.IGNORECASE)
             if match:
-                return match.group(1).strip()
+                result = match.group(1).strip()
+                # Reject if it looks like a word rather than a document number
+                if result.lower() in ("details", "date", "summary", "pilot", "invoicepilot"):
+                    continue
+                return result
         return None
 
     def _extract_date(self, text: str, keywords: list[str]) -> Optional[str]:
@@ -508,34 +520,48 @@ class AIExtractor:
         """Extract monetary amounts (total, subtotal, tax, etc.)."""
         amounts = {}
 
+        # Pre-process: join lines where a label is followed by a value on the next line
+        # e.g. "Subtotal:\n$4,200.00" -> "Subtotal: $4,200.00"
+        joined_text = re.sub(
+            r'((?:total|subtotal|sub-total|tax|discount|paid|outstanding|balance|amount|due|charged|value)[^\n]{0,30}):?\s*\n\s*',
+            r'\1: ',
+            text,
+            flags=re.IGNORECASE,
+        )
+
         # Amount extraction patterns — maps keywords to dict keys
+        # Use [^\d]*? to skip non-digit chars (currency symbols, spaces) between label and amount
         amount_keywords = {
-            "total": [
-                r"(?:grand\s+)?total\s*(?:due|amount|invoice\s*value|charged)?[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
-                r"total\s*\(?\s*(?:USD|EUR|GBP|INR|CAD|AUD)?\s*\)?[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
-            ],
             "subtotal": [
-                r"sub[\s\-]?total[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
-                r"taxable\s+amount[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+                r"sub[\s\-]?total[^\d]*?\$?\s*([\d,]+\.\d{2})",
+                r"taxable\s+amount[^\d]*?\$?\s*([\d,]+\.\d{2})",
+            ],
+            "total": [
+                # Require "total" NOT preceded by "sub" to avoid matching "subtotal"
+                r"(?<!sub)(?<!sub\s)total\s*(?:due|amount|invoice\s*value|charged)[^\d]*?\$?\s*([\d,]+\.\d{2})",
+                r"(?<!sub)(?<!sub\s)total\s*\(?\s*(?:USD|EUR|GBP|INR|CAD|AUD)?\s*\)?[^\d]*?\$?\s*([\d,]+\.\d{2})",
+                r"(?:grand\s+)?total[^\d]*?\$?\s*([\d,]+\.\d{2})",
             ],
             "tax": [
-                r"(?:tax|vat|gst|cgst|sgst|igst|sales\s+tax)[\s\(][^:]*?[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
-                r"tax[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+                # Match "Tax (8.25%): $346.50" — skip the percentage, capture the dollar amount
+                r"(?:tax|vat|gst|sales\s+tax)\s*(?:\([^)]*%\))?[^\d$₹€£]*?[\$₹€£]\s*([\d,]+\.\d{2})",
+                # Match "CGST @ 9%: INR 6,750.00" style
+                r"(?:tax|vat|gst)[^:]*?:\s*(?:INR|USD|EUR|GBP|\$|₹|€|£)?\s*([\d,]+\.\d{2})",
             ],
             "discount": [
-                r"discount[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+                r"discount[^\d]*?\$?\s*([\d,]+\.\d{2})",
             ],
             "paid": [
-                r"(?:amount\s+)?paid[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+                r"(?:amount\s+)?paid[^\d]*?\$?\s*([\d,]+\.\d{2})",
             ],
             "outstanding": [
-                r"(?:outstanding|balance\s+due|amount\s+due)[\s:]*[^\d\n]*?([\d,]+\.?\d{0,2})",
+                r"(?:outstanding|balance\s+due|amount\s+due)[^\d]*?\$?\s*([\d,]+\.\d{2})",
             ],
         }
 
         for key, patterns in amount_keywords.items():
             for pat in patterns:
-                match = re.search(pat, text, re.IGNORECASE)
+                match = re.search(pat, joined_text, re.IGNORECASE)
                 if match:
                     try:
                         val = float(match.group(1).replace(",", ""))
@@ -561,6 +587,16 @@ class AIExtractor:
                         pass
             if cgst + sgst > 0:
                 amounts["tax"] = cgst + sgst
+
+        # Smart derivation: compute missing values from what we have
+        # If total equals subtotal but we have tax, the "total" regex matched subtotal by accident
+        if ("total" in amounts and "subtotal" in amounts and "tax" in amounts
+                and amounts["total"] == amounts["subtotal"]):
+            amounts["total"] = round(amounts["subtotal"] + amounts["tax"], 2)
+
+        # If no total but have subtotal + tax, derive it
+        if "total" not in amounts and "subtotal" in amounts and "tax" in amounts:
+            amounts["total"] = round(amounts["subtotal"] + amounts["tax"], 2)
 
         # If no subtotal but have total and tax, derive it
         if "subtotal" not in amounts and "total" in amounts and "tax" in amounts:

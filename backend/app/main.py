@@ -87,8 +87,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
+    allow_origin_regex=r"https://.*\.onrender\.com",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -234,10 +235,24 @@ async def _process_document(document_id: str):
             if not extracted_text or len(extracted_text.strip()) < 10:
                 raise ValueError("Could not extract meaningful text from document")
 
-            # Step 2: AI extraction
+            # Step 2: AI extraction (potentially slow — run outside transaction)
             job.step = "ai_extraction"
             db.commit()
+            # expire all objects so session is clean before the slow AI call
+            db.expire_all()
             ai_result = await ai_extractor.extract(extracted_text)
+
+            # Re-load doc and job after the potentially long AI call
+            db.expire_all()
+            doc = db.query(Document).filter(Document.id == document_id).first()
+            job = (
+                db.query(ProcessingJob)
+                .filter(ProcessingJob.document_id == document_id)
+                .order_by(ProcessingJob.started_at.desc())
+                .first()
+            )
+            if not doc or not job:
+                raise ValueError("Document or job disappeared after AI extraction")
 
             # Step 3: Validation
             job.step = "validation"
@@ -259,8 +274,16 @@ async def _process_document(document_id: str):
             else:
                 review_status = "pending"  # Never auto-mark as reviewed
 
-            # Create Invoice record
+            # Remove existing invoice if re-processing
+            existing_invoice = db.query(Invoice).filter(Invoice.document_id == doc.id).first()
+            if existing_invoice:
+                db.delete(existing_invoice)
+                db.flush()
+
+            # Create Invoice record with explicit UUID
+            invoice_id = str(uuid.uuid4())
             invoice = Invoice(
+                id=invoice_id,
                 document_id=doc.id,
                 vendor_name=ai_result.vendor_name,
                 vendor_address=ai_result.vendor_address,
@@ -283,12 +306,14 @@ async def _process_document(document_id: str):
                 raw_extracted_json=json.dumps(ai_result.model_dump()),
             )
             db.add(invoice)
+            db.flush()
 
             # Save line items
             if ai_result.line_items:
                 for item in ai_result.line_items:
                     line = LineItem(
-                        invoice_id=invoice.id,
+                        id=str(uuid.uuid4()),
+                        invoice_id=invoice_id,
                         description=item.description,
                         quantity=item.quantity,
                         unit_price=item.unit_price,
@@ -298,9 +323,11 @@ async def _process_document(document_id: str):
                     db.add(line)
 
             doc.status = "completed"
+            doc.error_message = None
             doc.processed_time = datetime.now(timezone.utc)
 
             job.status = "completed"
+            job.error_message = None
             job.completed_at = datetime.now(timezone.utc)
 
             db.commit()
@@ -310,13 +337,26 @@ async def _process_document(document_id: str):
             )
 
         except Exception as e:
-            doc.status = "failed"
-            doc.error_message = str(e)[:500]  # Truncate error
-            job.status = "failed"
-            job.error_message = str(e)[:500]
-            job.completed_at = datetime.now(timezone.utc)
-            db.commit()
-            logger.error("Processing failed for %s: %s", doc.id, str(e)[:200])
+            logger.error("Processing failed for %s: %s", doc.id if doc else document_id, str(e)[:200])
+            db.rollback()
+            try:
+                fail_doc = db.query(Document).filter(Document.id == document_id).first()
+                if fail_doc:
+                    fail_doc.status = "failed"
+                    fail_doc.error_message = str(e)[:500]
+                fail_job = (
+                    db.query(ProcessingJob)
+                    .filter(ProcessingJob.document_id == document_id)
+                    .order_by(desc(ProcessingJob.started_at))
+                    .first()
+                )
+                if fail_job:
+                    fail_job.status = "failed"
+                    fail_job.error_message = str(e)[:500]
+                    fail_job.completed_at = datetime.now(timezone.utc)
+                db.commit()
+            except Exception as rollback_err:
+                logger.error("Failed to commit failure status: %s", rollback_err)
 
     except Exception as e:
         logger.error("Fatal processing error for %s: %s", document_id, str(e)[:200])

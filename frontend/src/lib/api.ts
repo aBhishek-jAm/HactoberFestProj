@@ -4,7 +4,10 @@
  * All backend communication goes through this module.
  */
 
-const API_BASE = "/api"
+const BASE_URL = import.meta.env.VITE_API_URL
+  ? String(import.meta.env.VITE_API_URL).replace(/\/$/, "")
+  : ""
+const API_BASE = `${BASE_URL}/api`
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${API_BASE}${path}`

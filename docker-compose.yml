@@ -14,7 +14,7 @@ services:
       - DATABASE_URL=sqlite:///./invoicepilot.db
       - UPLOAD_DIR=./uploads
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=gemma3:4b
+      - OLLAMA_MODEL=gemma:2b
       - CORS_ORIGINS=http://localhost:5173,http://localhost:3000
       - DEMO_MODE=false
     depends_on: []

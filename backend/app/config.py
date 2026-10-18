@@ -21,13 +21,14 @@ class Settings(BaseSettings):
     # Ollama / AI
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "gemma:2b"
-    ollama_timeout: int = 120
-    ollama_context_length: int = 8192
+    ollama_timeout: int = 30  # Seconds; fall back to heuristics if exceeded
+    ollama_context_length: int = 2048  # Smaller ctx = faster on 2b models
+    ollama_num_predict: int = 512  # Max tokens in response
     demo_mode: bool = False
 
     # Processing
     arithmetic_tolerance: float = 0.02
-    max_retries: int = 3
+    max_retries: int = 1  # 1 AI attempt, then heuristic fallback
 
     # Security
     log_level: str = "info"
